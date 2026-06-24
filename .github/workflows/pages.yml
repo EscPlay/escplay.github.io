@@ -1,0 +1,86 @@
+name: Deploy GitHub Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful build run in EscPlay/escplay-site
+        required: true
+        type: string
+      source_sha:
+        description: Source commit packaged by that run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Verify private build and download website
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_PAGES_TOKEN }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || { echo 'Invalid run ID'; exit 1; }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid source SHA'; exit 1; }
+          test -n "$GH_TOKEN" || { echo 'Missing CROSS_REPO_PAGES_TOKEN secret'; exit 1; }
+
+          # Dispatch is the last private build step. Wait for that run to finish.
+          for attempt in {1..60}; do
+            run=$(gh api "repos/EscPlay/escplay-site/actions/runs/$SOURCE_RUN_ID")
+            jq -e --arg sha "$SOURCE_SHA" '
+              .head_repository.full_name == "EscPlay/escplay-site" and
+              .head_branch == "master" and .head_sha == $sha and
+              .path == ".github/workflows/pages.yml" and
+              (.event == "push" or .event == "workflow_dispatch")
+            ' <<< "$run" > /dev/null
+            status=$(jq -r '.status' <<< "$run")
+            if [[ "$status" == "completed" ]]; then
+              jq -e '.conclusion == "success"' <<< "$run" > /dev/null
+              break
+            fi
+            sleep 5
+          done
+          [[ "$status" == "completed" ]] || { echo 'Source build did not finish in time'; exit 1; }
+          gh run download "$SOURCE_RUN_ID" --repo EscPlay/escplay-site \
+            --name escplay-site --dir _site
+
+          # Publish only this explicit list; never upload the private repository.
+          printf '%s\n' index.html styles-v8.css \
+            voicision/index.html \
+            voicision/en/index.html voicision/voicision-v16.css voicision/assets/icon-navy.png \
+            voicision/pt-br/index.html \
+            voicision/privacy/index.html \
+            voicision/privacy/privacy-v9.css | LC_ALL=C sort > expected-files.txt
+          find _site -type f -printf '%P\n' | LC_ALL=C sort > actual-files.txt
+          diff -u expected-files.txt actual-files.txt
+          test -z "$(find _site -type l -print)"
+          while IFS= read -r file; do test -s "_site/$file"; done < expected-files.txt
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
